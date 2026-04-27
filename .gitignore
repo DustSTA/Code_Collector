@@ -1,16 +1,8 @@
-# 忽略 Python 编译缓存
 __pycache__/
 *.pyc
-
-# 忽略日志文件
 *.log
-
-# 忽略 VSCode 配置
 .vscode/
-
-# 忽略 PyCharm 的配置文件夹
 .idea/
-
-# 忽略系统文件
 .DS_Store
 Thumbs.db
+.venv/
