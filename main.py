@@ -2,35 +2,66 @@ import os
 import sys
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QFileDialog,
-                             QCheckBox, QGridLayout, QMessageBox)
-from PyQt6.QtCore import Qt
+                             QCheckBox, QGridLayout, QMessageBox, QProgressDialog)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
-def collect_files_code(root_dir, extensions, output_file):
-    """
-    遍历指定目录及其子目录，提取指定扩展名文件的内容，写入txt文件
-    """
-    try:
-        with open(output_file, 'w', encoding='utf-8') as out_f:
-            for foldername, subfolders, filenames in os.walk(root_dir):
+IGNORE_DIRS = {'.git', '.svn', 'node_modules', '.venv', 'venv', '__pycache__', '.idea', 'build', 'dist'}
+
+def resource_path(relative_path):
+    """获取资源绝对路径，兼容 PyInstaller 打包环境"""
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.abspath(relative_path)
+
+class ExtractionThread(QThread):
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(bool, str, int)
+
+    def __init__(self, root_dir, extensions, output_file):
+        super().__init__()
+        self.root_dir = root_dir
+        self.extensions = extensions
+        self.output_file = output_file
+
+    def run(self):
+        try:
+            target_files = []
+            for foldername, subfolders, filenames in os.walk(self.root_dir):
+                subfolders[:] = [d for d in subfolders if d not in IGNORE_DIRS]
                 for filename in filenames:
                     ext = os.path.splitext(filename)[1].lower()
-                    if ext in extensions:
-                        file_path = os.path.join(foldername, filename)
-                        try:
-                            with open(file_path, 'r', encoding='utf-8') as f:
-                                # 尝试读取确定是否为纯文本
-                                content = f.read()
-                            relative_path = os.path.relpath(file_path, root_dir)
-                            out_f.write(f"《{relative_path}》\n\n")
-                            out_f.write(content)
-                            out_f.write("\n\n" + "-"*80 + "\n\n")
-                        except Exception as e:
-                            # 忽略无法读取的二进制文件或编码错误
-                            pass
-        return True, "提取成功！"
-    except Exception as e:
-        return False, str(e)
+                    if ext in self.extensions:
+                        target_files.append(os.path.join(foldername, filename))
+            
+            total = len(target_files)
+            if total == 0:
+                self.finished.emit(False, "未找到符合条件的文件！", 0)
+                return
 
+            count = 0
+            with open(self.output_file, 'w', encoding='utf-8') as out_f:
+                for file_path in target_files:
+                    content = None
+                    for enc in ['utf-8', 'gbk']:
+                        try:
+                            with open(file_path, 'r', encoding=enc) as f:
+                                content = f.read()
+                            break
+                        except UnicodeDecodeError:
+                            continue
+                    
+                    if content is not None:
+                        relative_path = os.path.relpath(file_path, self.root_dir)
+                        out_f.write(f"《{relative_path}》\n\n")
+                        out_f.write(content)
+                        out_f.write("\n\n" + "-"*80 + "\n\n")
+                        count += 1
+                    
+                    self.progress.emit(count, total)
+
+            self.finished.emit(True, "提取成功！", count)
+        except Exception as e:
+            self.finished.emit(False, str(e), 0)
 
 def get_available_extensions(root_dir):
     """扫描目录及其子目录，返回存在的文本文件扩展名集合"""
@@ -38,8 +69,8 @@ def get_available_extensions(root_dir):
     if not os.path.isdir(root_dir):
         return found_exts
     
-    # 为了避免扫描太久，可以限制深度或者仅取部分
     for foldername, subfolders, filenames in os.walk(root_dir):
+        subfolders[:] = [d for d in subfolders if d not in IGNORE_DIRS]
         for filename in filenames:
             ext = os.path.splitext(filename)[1].lower()
             if ext:
@@ -77,14 +108,16 @@ class TitleBar(QWidget):
         
         from PyQt6.QtGui import QPixmap, QIcon
         icon_label = QLabel()
-        logo_pixmap = QPixmap("logo.png")
+        logo_pixmap = QPixmap(resource_path("logo.png"))
         if not logo_pixmap.isNull():
-            icon_label.setPixmap(logo_pixmap.scaled(20, 20, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            icon_label.setPixmap(logo_pixmap)
+            icon_label.setScaledContents(True)
+            icon_label.setFixedSize(20, 20)
         else:
             icon_label.setText("")
             
         if parent:
-            parent.setWindowIcon(QIcon("logo.png"))
+            parent.setWindowIcon(QIcon(resource_path("logo.png")))
 
         title_label = QLabel("代码收集器")
         title_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #333;")
@@ -279,7 +312,7 @@ class CodeCollectorApp(QWidget):
         self.layout_content.addWidget(btn_run)
 
     def applyStyle(self):
-        bg_path = os.path.abspath("background.png").replace("\\", "/")
+        bg_path = resource_path("background.png").replace("\\", "/")
         self.setStyleSheet(f"""
             QWidget#MainContainer {{
                 background-color: white;
@@ -442,10 +475,34 @@ class CodeCollectorApp(QWidget):
             return
 
         out_file = os.path.join(out_dir, "All_Code.txt")
-        success, msg = collect_files_code(target_dir, extensions, out_file)
         
+        self.progress_dialog = QProgressDialog("正在准备提取代码...", "取消", 0, 100, self)
+        self.progress_dialog.setWindowTitle("提取进度")
+        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress_dialog.setAutoClose(True)
+        self.progress_dialog.setAutoReset(True)
+        self.progress_dialog.setMinimumDuration(0)
+        
+        self.thread = ExtractionThread(target_dir, extensions, out_file)
+        self.thread.progress.connect(self.update_progress)
+        self.thread.finished.connect(self.extraction_finished)
+        
+        self.progress_dialog.canceled.connect(self.thread.terminate)
+        
+        self.thread.start()
+        self.progress_dialog.show()
+
+    def update_progress(self, current, total):
+        if total > 0:
+            self.progress_dialog.setMaximum(total)
+            self.progress_dialog.setValue(current)
+            self.progress_dialog.setLabelText(f"正在提取代码... ({current}/{total})")
+
+    def extraction_finished(self, success, msg, count):
+        self.progress_dialog.setValue(self.progress_dialog.maximum())
+        self.progress_dialog.close()
         if success:
-            QMessageBox.information(self, "成功", f"文件内容已成功写入:\n{out_file}")
+            QMessageBox.information(self, "成功", f"文件内容已成功写入:\n{self.thread.output_file}\n\n共成功提取了 {count} 个文件。")
         else:
             QMessageBox.critical(self, "失败", f"提取时发生错误:\n{msg}")
 
